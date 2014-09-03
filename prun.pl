@@ -25,59 +25,90 @@ use strict;
 
 use Term::ANSIColor qw(:constants);
 
-my %children;
+use constant MAX_FORKS => 50;
+
 my %running;
 my %failed;
 my %success;
 my $count = 0;
 
+sub spaw_child {
+  my($hostname, $command) = @_;
+
+  if(my $pid = fork()) {
+    my $child = {
+      'hostname' => $hostname,
+      'pid'      => $pid,
+      'rc'       => -1,
+    };
+    return $child;
+  }
+
+  print "Execute ", BOLD, $command, RESET, " on ", GREEN, $hostname, RESET, "...\n";
+  open STDOUT, '>', "${hostname}.out";
+  open STDERR, '>&', STDOUT;
+  close STDIN;
+  exec '/usr/bin/ssh', '-n', '-oPreferredAuthentications=publickey',
+    '-oStrictHostKeyChecking=yes', $hostname, $command;
+  exit 12;
+}
+
+sub process_child {
+  my $pid = wait();
+  return -1 if $pid == -1;
+
+  my $rc = $? >> 8;
+
+  if (exists($running{$pid})) {
+    my $child = $running{$pid};
+    $child->{'rc'} = $rc;
+    if ($rc == 0) {
+      $success{$pid} = $child;
+    }
+    else {
+      $failed{$pid} = $child;
+    }
+    delete $running{$pid};
+    print "Finished (", BOLD, YELLOW, $count - scalar(keys %running), RESET, " of ",
+      BOLD, YELLOW, $count, RESET, ") ",
+      GREEN, $child->{'hostname'}, RESET,
+      " (rc=", ($rc == 0 ? GREEN : RED), BOLD, $rc, RESET, ")\n";
+  }
+  return 1;
+}
+
 while(<>) {
   chomp;
+  next if /^\s*#/;
+  next if /^\s*$/;
+
   if(m/^(\S+)\s+(.+)$/) {
     my $hostname = $1;
     my $command = $2;
 
-    if(my $pid = fork()) {
-      $children{$pid} = {
-        'hostname' => $hostname,
-        'pid'      => $pid,
-        'rc'       => -1,
-      };
-      $running{$pid} = $children{$pid};
-      $count++;
+    while(scalar(keys %running) >= MAX_FORKS) {
+      process_child();
     }
-    elsif(defined $pid) {
-      print "Execute ", BOLD, $command, RESET, " on ", GREEN, $hostname, RESET, "...\n";
-      open STDOUT, '>', "${hostname}.out";
-      open STDERR, '>&', STDOUT;
-      close STDIN;
-      exec '/usr/bin/ssh', '-n', '-oPreferredAuthentications=publickey',
-        '-oStrictHostKeyChecking=yes', $hostname, $command;
-      exit 12;
-    }
+
+    my $child = spaw_child($hostname, $command);
+    my $pid = $child->{'pid'};
+    $running{$pid} = $child;
+    $count++;
   }
   else {
     print "Invalid content \"$_\" at line $.. Ignore this line\n";
   }
 }
 
-while(my $pid = wait()) {
-  last if $pid == -1;
-  my $rc = $? >> 8;
+while(process_child() != -1){
+}
 
-  if (exists($children{$pid})) {
-    $children{$pid}->{'rc'} = $rc;
-    delete $running{$pid};
-    if ($rc == 0) {
-      $success{$pid} = $children{$pid};
-    }
-    else {
-      $failed{$pid} = $children{$pid};
-    }
-    print "Finished (", BOLD, YELLOW, $count - scalar(keys %running), RESET, " of ",
-      BOLD, YELLOW, $count, RESET, ") ",
-      GREEN, $children{$pid}->{'hostname'}, RESET,
-      " (rc=", ($rc == 0 ? GREEN : RED), BOLD, $rc, RESET, ")\n";
+print "Everyone died ;-)\n";
+
+if(scalar(keys %failed)) {
+  print "\n";
+  print "Summary: ", BOLD, YELLOW, scalar(keys %failed), RESET, " of ", BOLD, YELLOW, $count, RESET, " systems failed:\n";
+  foreach my $key (sort keys %failed) {
+    print " ", RED, "*", RESET, " ", GREEN, $failed{$key}->{'hostname'}, RESET, " (rc=", BOLD, RED, $failed{$key}->{'rc'}, RESET, ")\n";
   }
 }
-print "Everyone died ;-)\n"
